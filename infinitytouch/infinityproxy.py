@@ -6,10 +6,13 @@ import datetime
 import urllib.request
 import tornado.ioloop
 import tornado.web
+import tornado.httpclient
 import xmltodict
 import json
+from expiringfilecache import ExpiringFileCache as FileCache
+import copy
 
-LOG_FORMAT = "%(asctime)s,%(msecs)03d %(name)s[%(process)d] %(levelname)s %(message)s"
+LOG_FORMAT = "%(asctime)s %(name)s[%(process)d] %(levelname)s %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("InfinityProxy")
 
@@ -21,25 +24,28 @@ logging.getLogger("tornado.access").propagate = False
 
 DEFAULT_STATEDIR = "./state"
 DEFAULT_PORT = 3000
-DEFAULT_LOGLEVEL = "INFO"
+DEFAULT_LOGLEVEL = "DEBUG"
+DEFAULT_PASSTHRU = 1
 
 FILE_SYSTEM = "system.xml"
 FILE_STATUS = "status.xml"
-FILE_CHANGEFLAG = "changes"
+FILE_LOCAL_CHANGEFLAG = "local_changes"
+FILE_REMOTE_CHANGEFLAG = "remote_changes"
 TYPE_XML = "text/xml"
 TYPE_JSON = "application/json"
 TYPE_TEXT = "text/plain"
 
 class InfinityProxy:
 
-    def __init__(self, wundergroundApiKey="", port=DEFAULT_PORT, logLevel=DEFAULT_LOGLEVEL, stateDir=DEFAULT_STATEDIR):
+    def __init__(self, wundergroundApiKey="", port=DEFAULT_PORT, logLevel=DEFAULT_LOGLEVEL, stateDir=DEFAULT_STATEDIR, passthroughInterval=DEFAULT_PASSTHRU):
         logger.setLevel(logLevel)
         os.makedirs(stateDir, exist_ok=True)
 
         logger.info("Starting the Infinity proxy service on port %s", port)
         appSettings = {
             "wundergroundApiKey" : str(wundergroundApiKey),
-            "stateDirectory" : stateDir
+            "stateDirectory" : stateDir,
+            "passthroughInterval" : int(passthroughInterval)
         }
         app = self.getTornadoApp(appSettings)
         app.listen(int(port))
@@ -54,25 +60,25 @@ class InfinityProxy:
             #######################################################################
             # URI's corresponding to the Infinity thermostat protocol
             #######################################################################
-            (r"/systems/(?P<systemID>\w*)/status", StatusUpdateHandler),
-            (r"/systems/(?P<systemID>\w*)/config", ConfigRequestHandler),
-            (r"/systems/(?P<systemID>\w*)/notifications", NotificationUpdateHandler),
-            (r"/systems/(?P<systemID>\w*)/profile", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/dealer", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/idu_config", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/odu_config", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/utility_events", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/energy", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/idu_status", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/odu_status", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/idu_faults", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/odu_faults", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/equipment_events", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/history", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)/root_cause", LocalSaveHandler),
-            (r"/systems/(?P<systemID>\w*)", ConfigUpdateHandler),
-            (r"/Alive", AliveHandler),
-            (r"/weather/(?P<zipCode>.\w*)/forecast", WeatherUndergroundHandler),
+            (r"/systems/(?P<systemID>\w*)/status", StatusUpdateHandler, {"action" : "status"}),
+            (r"/systems/(?P<systemID>\w*)/config", ConfigRequestHandler, {"action" : "config"}),
+            (r"/systems/(?P<systemID>\w*)/notifications", NotificationUpdateHandler, {"action" : "notifications"}),
+            (r"/systems/(?P<systemID>\w*)/profile", LocalSaveHandler, {"action" : "profile"}),
+            (r"/systems/(?P<systemID>\w*)/dealer", LocalSaveHandler, {"action" : "dealer"}),
+            (r"/systems/(?P<systemID>\w*)/idu_config", LocalSaveHandler, {"action" : "idu_config"}),
+            (r"/systems/(?P<systemID>\w*)/odu_config", LocalSaveHandler, {"action" : "odu_config"}),
+            (r"/systems/(?P<systemID>\w*)/utility_events", LocalSaveHandler, {"action" : "utility_events"}),
+            (r"/systems/(?P<systemID>\w*)/energy", LocalSaveHandler, {"action" : "energy"}),
+            (r"/systems/(?P<systemID>\w*)/idu_status", LocalSaveHandler, {"action" : "idu_status"}),
+            (r"/systems/(?P<systemID>\w*)/odu_status", LocalSaveHandler, {"action" : "odu_status"}),
+            (r"/systems/(?P<systemID>\w*)/idu_faults", LocalSaveHandler, {"action" : "idu_faults"}),
+            (r"/systems/(?P<systemID>\w*)/odu_faults", LocalSaveHandler, {"action" : "odu_faults"}),
+            (r"/systems/(?P<systemID>\w*)/equipment_events", LocalSaveHandler, {"action" : "equipment_events"}),
+            (r"/systems/(?P<systemID>\w*)/history", LocalSaveHandler, {"action" : "history"}),
+            (r"/systems/(?P<systemID>\w*)/root_cause", LocalSaveHandler, {"action" : "root_cause"}),
+            (r"/systems/(?P<systemID>\w*)", ConfigUpdateHandler, {"action" : "system"}),
+            (r"/Alive", AliveHandler, {"action" : "Alive"}),
+            (r"/weather/(?P<zipCode>.\w*)/forecast", WeatherUndergroundHandler, {"action" : "forecast"}),
 
             #######################################################################
             # API for external apps to interface with the thermostat
@@ -90,12 +96,12 @@ class InfinityProxy:
             #######################################################################
             # Catch-all for API calls we don't handle
             #######################################################################
-            (r"/api/.*", APIHandler, {"action": "NotImplemented"}),
+            (r"/api/.*", APIHandler, {"action": "APINotImplemented"}),
 
             #######################################################################
             # Catch-all for anything else
             #######################################################################
-            (r"/.*", DefaultHandler)
+            (r"/.*", DefaultHandler, {"action": "RequestNotImplemented"})
 
         ], **appSettings)
 
@@ -109,34 +115,58 @@ class BaseHandler(tornado.web.RequestHandler):
         self.stateDirectory = self.application.settings.get("stateDirectory")
         self.systemPath = os.path.join(self.stateDirectory, FILE_SYSTEM)
         self.statusPath = os.path.join(self.stateDirectory, FILE_STATUS)
-        self.changePath = os.path.join(self.stateDirectory, FILE_CHANGEFLAG)
+        self.localChangePath = os.path.join(self.stateDirectory, FILE_LOCAL_CHANGEFLAG)
+        self.action = self.handlerConfig.get("action", None)
+        self.remoteChangePath = os.path.join(self.stateDirectory, FILE_REMOTE_CHANGEFLAG)
+        self.passthroughInterval = self.application.settings.get("passthroughInterval")
         logger.debug("%s: %s", self.request.method, self.request.uri)
 
-    def writeDataToFile(self, data, filePath):
+        # Skip if passthrough is not enabled, or this is a local api call, or we have pending local changes
+        if self.passthroughInterval <= 0 or not any(s in self.request.host for s in ["carrier", "bryant"]) or self.isLocalConfigChange():
+            logger.debug("Skipping passthrough")
+
+        # If Carrier indicated pending changes on the last Status response,
+        # or the requested file is not locally cached, proxy this request on to Carrier
+        if self.isRemoteConfigChange() or not FileCache.exists(os.path.join(self.stateDirectory, self.action), ignoreExt=True):
+            logger.debug("Passing through the request")
+            request = copy.copy(self.request)
+            request.protocol = "https"
+            response = yield tornado.httpclient.AsyncHTTPClient().fetch(request)
+            logger.debug(response.body)
+
+
+    def writeDataToFile(self, data, filePath, secondsToLive=None):
         try:
-            with open(filePath, 'wb') as f:
-                f.write(data)
+            FileCache.write(filePath, data, secondsToLive)
         except Exception as e:
             logger.error("Failed to write '%s': %s'", filePath, e)
             raise e
 
     def readDataFromFile(self, filePath):
         try:
-            with open(filePath, 'rb') as f:
-                data = f.read()
+            data = FileCache.read(filePath)
         except Exception as e:
             logger.error("Failed to read '%s': %s'", filePath, e)
             return ""
         return data
 
-    def configIsChanged(self):
-        return os.path.exists(self.changePath)
+    def isLocalConfigChange(self):
+        return FileCache.exists(self.localChangePath)
 
-    def setChangeFlag(self, enabled):
+    def setLocalConfigChange(self, enabled):
         if bool(enabled):
-            self.writeDataToFile(b"true", self.changePath)
+            FileCache.write(self.localChangePath, b"true")
         else:
-            os.remove(self.changePath)
+            FileCache.remove(self.localChangePath)
+
+    def isRemoteConfigChange(self):
+        return FileCache.exists(self.remoteChangePath)
+
+    def setRemoteConfigChange(self, enabled):
+        if bool(enabled):
+            FileCache.write(self.remoteChangePath, b"true")
+        else:
+            FileCache.remove(self.remoteChangePath)
 
     def formatOutgoingXml(self, rootElement):
         xmlString = ET.tostring(rootElement)
@@ -192,7 +222,7 @@ class StatusUpdateHandler(BaseHandler):
         self.writeDataToFile(data, self.statusPath)
 
         elementTextUpdates = {"timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
-        if self.configIsChanged():
+        if self.isLocalConfigChange():
             elementTextUpdates.update({"serverHasChanges": "true", "configHasChanges": "true"})
         responseXml = self.generateResponseXml(systemID, elementTextUpdates)
         self.writeResponse(responseXml, TYPE_XML)
@@ -264,7 +294,7 @@ class ConfigRequestHandler(BaseHandler):
         configElement.insert(0, atomHrefElement)
         configElement.insert(0, atomSelfElement)
         self.writeResponse(root, TYPE_XML)
-        self.setChangeFlag(False)
+        self.setLocalConfigChange(False)
 
 
 class NotificationUpdateHandler(BaseHandler):
@@ -451,7 +481,7 @@ class APIHandler(BaseHandler):
         xmlString = self.formatOutgoingXml(root)
         try:
             self.writeDataToFile(xmlString, self.systemPath)
-            self.setChangeFlag(True)
+            self.setLocalConfigChange(True)
         except Exception as e:
             logger.warning("Failed to update system config: %s", e)
 
