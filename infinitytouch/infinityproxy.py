@@ -17,10 +17,12 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger("InfinityProxy")
 
 # Disable Tornado's access logging - we'll output ourselves
+'''
 hn = logging.NullHandler()
 hn.setLevel(logging.DEBUG)
 logging.getLogger("tornado.access").addHandler(hn)
 logging.getLogger("tornado.access").propagate = False
+'''
 
 DEFAULT_STATEDIR = "./state"
 DEFAULT_PORT = 3000
@@ -31,9 +33,19 @@ FILE_SYSTEM = "system.xml"
 FILE_STATUS = "status.xml"
 FILE_LOCAL_CHANGEFLAG = "local_changes"
 FILE_REMOTE_CHANGEFLAG = "remote_changes"
+
 TYPE_XML = "text/xml"
 TYPE_JSON = "application/json"
 TYPE_TEXT = "text/plain"
+MAP_TYPE_EXT = {
+    "text/xml" : ".xml",
+    "application/xml": ".xml",
+    "application/json" : ".json",
+    "text/plain" : ""
+}
+
+
+
 
 class InfinityProxy:
 
@@ -109,8 +121,10 @@ class InfinityProxy:
 class BaseHandler(tornado.web.RequestHandler):
     """Provide common attributes and methods for all requests."""
 
-    def initialize(self, **kwargs):
-        tornado.web.RequestHandler.initialize(self)
+    @tornado.web.asynchronous
+    @tornado.gen.coroutine
+    def initialize(self, *args, **kwargs):
+        logger.debug("Initializing %s request to: %s", self.request.method, self.request.path)
         self.handlerConfig = kwargs
         self.stateDirectory = self.application.settings.get("stateDirectory")
         self.systemPath = os.path.join(self.stateDirectory, FILE_SYSTEM)
@@ -119,21 +133,46 @@ class BaseHandler(tornado.web.RequestHandler):
         self.action = self.handlerConfig.get("action", None)
         self.remoteChangePath = os.path.join(self.stateDirectory, FILE_REMOTE_CHANGEFLAG)
         self.passthroughInterval = self.application.settings.get("passthroughInterval")
-        logger.debug("%s: %s", self.request.method, self.request.uri)
+        self.isPassthrough = False
 
         # Skip if passthrough is not enabled, or this is a local api call, or we have pending local changes
-        if self.passthroughInterval <= 0 or not any(s in self.request.host for s in ["carrier", "bryant"]) or self.isLocalConfigChange():
-            logger.debug("Skipping passthrough")
+        if self.passthroughInterval <= 0 \
+                or not any(s in self.request.host for s in ["carrier", "bryant"]) \
+                or self.isLocalConfigChange():
+            return
+
+        self.isPassthrough = True
 
         # If Carrier indicated pending changes on the last Status response,
         # or the requested file is not locally cached, proxy this request on to Carrier
-        if self.isRemoteConfigChange() or not FileCache.exists(os.path.join(self.stateDirectory, self.action), ignoreExt=True):
-            logger.debug("Passing through the request")
-            request = copy.copy(self.request)
+        if self.isRemoteConfigChange() \
+                or not FileCache.exists(os.path.join(self.stateDirectory, self.action), ignoreExt=True):
+            remoteurl = "{}://{}{}".format(self.request.protocol, self.request.host, self.request.uri)
+            request = tornado.httpclient.HTTPRequest(remoteurl,
+                                                     method=self.request.method,
+                                                     headers=self.request.headers,
+                                                     body=self.request.body,
+                                                     allow_nonstandard_methods=True)
             request.protocol = "https"
+            logger.debug("PASSTHRU: Request to %s", remoteurl)
             response = yield tornado.httpclient.AsyncHTTPClient().fetch(request)
-            logger.debug(response.body)
+            if response.code >= 200 and response.code < 300:
+                logger.debug("PASSTHRU Response Headers:\n%s", response.headers)
+                contentLength = int(response.headers.get("Content-Length", 0))
+                if contentLength == 0:
+                    logger.debug("PASSTHRU Response: NO CONTENT")
+                else:
+                    contentType = response.headers["Content-Type"].split("; ")[0]
+                    localFile = os.path.join(self.stateDirectory, self.action + MAP_TYPE_EXT[contentType])
+                    logger.debug("PASSTHRU: I would write the following to %s:\n%s", localFile, response.body)
 
+
+    def writeResponseDataToFile(self, response, secondsToLive=None):
+        data = self.request.arguments["data"][0]
+        ext = MAP_TYPE_EXT.get(self.request.headers("Content-Type"), "")
+        relFilePath = "{}{}".format(os.path.basename(self.request.path), ext)
+        filePath = os.path.join(self.stateDirectory, relFilePath)
+        self.writeDataToFile(data, filePath, secondsToLive)
 
     def writeDataToFile(self, data, filePath, secondsToLive=None):
         try:
